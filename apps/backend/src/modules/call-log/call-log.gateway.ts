@@ -42,6 +42,8 @@ export class CallLogGateway
   private openAiWs: WebSocket;
   private streamSid: string | null = null;
   private callSid: string | null = null;
+  private req_msg :boolean = false;
+  private conversation_id: string | null = null;
 
   afterInit() {
     console.log('WebSocket server initialized');
@@ -51,11 +53,13 @@ export class CallLogGateway
     const openAiApiKey = await this.systemConfigService.getConfigByKey('openai_api_key');
     console.log(openAiApiKey);
 
-    this.openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+    this.openAiWs = new WebSocket('wss://ea01-azureopenai-eus201.openai.azure.com/openai/realtime?api-version=2024-10-01-preview&deployment=ea01-us201-gpt-4o-realtime-preview', {
       headers: {
-        Authorization: `Bearer ${openAiApiKey}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
+        "api-key": openAiApiKey,
+        // Authorization: `Bearer ${openAiApiKey}`,
+        // "OpenAI-Beta": "realtime=v1"
+      },
+      timeout: 5000,
     });
 
     this.setupOpenAiWebSocket(client);
@@ -71,7 +75,7 @@ export class CallLogGateway
 
   private setupOpenAiWebSocket(client: WebSocket): void {
     this.openAiWs.on('open', async () => {
-      console.log('Connected to the OpenAI Realtime API');
+      console.log('Connected to the Azure OpenAI Realtime API');
       const callLog = await this.callLogService.findAll({
         where: [{ key: 'call_sid', operator: '=', value: this.callSid }],
       });
@@ -92,11 +96,11 @@ export class CallLogGateway
     });
 
     this.openAiWs.on('close', () => {
-      console.log('Disconnected from the OpenAI Realtime API');
+      console.log('Disconnected from the Azure OpenAI Realtime API');
     });
 
     this.openAiWs.on('error', (error) => {
-      console.error('Error in the OpenAI WebSocket:', error);
+      console.error('Error in the Azure OpenAI WebSocket:', error);
     });
   }
 
@@ -111,16 +115,102 @@ export class CallLogGateway
         instructions: systemMessage,
         modalities: ['text', 'audio'],
         temperature: 0.8,
+        tools: [
+          {
+            type: 'function',
+            name: 'call_kofe',
+            description: '调用kofe',
+            parameters: {
+              type: 'object',
+              properties: {
+                  query: {
+                      type: 'string',
+                      description: 'query from user',
+                  },
+              },
+              required: ['query'],
+          }
+        }
+        ],
       },
+      
     };
 
     console.log('Sending session update:', JSON.stringify(sessionUpdate));
     this.openAiWs.send(JSON.stringify(sessionUpdate));
   }
 
+  private async handleFunctionCall(message): Promise<void> {
+    try {
+      this.req_msg = false;
+      const params = JSON.parse(message.arguments);
+
+      const funcName: string = message.name;
+      console.log('Function call:', funcName, params);
+
+      const result = await fetch('https://demo.kofe.ai/v1/chat-messages', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer app-8vgs4ptlJA9N8fmp1R49w1VS',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          inputs: {
+            session_id: "test_session",
+          },
+          query: params.query,
+          response_mode: "blocking",
+          conversation_id: this.conversation_id,
+          user: "test_user",
+        }),
+      });
+      
+      const data = await result.json();
+      console.log("data======>",data)
+      if (!this.conversation_id) {
+        this.conversation_id = data.conversation_id;
+      }
+
+      this.openAiWs.send(JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'function_call_output',
+          call_id: message.call_id,
+          output: JSON.stringify({ response: data.answer }),
+        },
+      }));
+
+    } catch (error) {
+      console.error('Error call tool:', error, 'param',message);
+
+      this.openAiWs.send(JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'function_call_output',
+          call_id: message.call_id,
+          output: JSON.stringify({ error: "解析异常" }),
+        },
+      }));
+      
+
+    }
+    this.createResponse()
+
+  }
+  private createResponse() {
+    this.openAiWs.send(JSON.stringify({
+        type: 'input_audio_buffer.commit'
+    }));
+    this.openAiWs.send(JSON.stringify({
+        type: 'response.create'
+    }));
+    return true;
+}
+
   private handleOpenAiMessage(client: WebSocket, data: WebSocket.Data): void {
     try {
       const response = JSON.parse(data.toString());
+      console.log('Response', response);
 
       if (LOG_EVENT_TYPES.includes(response.type)) {
         console.log(`Received event: ${response.type}`, response);
@@ -128,6 +218,16 @@ export class CallLogGateway
 
       if (response.type === 'session.updated') {
         console.log('Session updated successfully:', response);
+      }
+
+      // response.function_call_arguments.done
+      if (response.type === 'response.function_call_arguments.done') {
+        if (this.req_msg) {
+          return;
+        }
+        this.req_msg = true;
+        this.handleFunctionCall(response);
+        // console.log('Function call arguments done:', response);
       }
 
       if (response.type === 'response.audio.delta' && response.delta) {

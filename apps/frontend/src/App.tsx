@@ -138,7 +138,7 @@ export default function RealtimeConsole() {
             header: 'Call',
             cell: (info) => (
                 <Button
-                    disabled={info.row.original.status === 'called'}
+                    // disabled={info.row.original.status === 'called'}
                     variant="ghost"
                     size="sm"
                     className={`${
